@@ -39,7 +39,7 @@ function M.check_cache(key)
     local ok, meta = pcall(cjson.decode, meta_raw)
     if not ok or not meta then return "MISS", nil end
     
-    local cache_control = meta.headers["cache-control"] or ""
+    local cache_control = (meta.headers and meta.headers["cache-control"]) or ""
     if cache_control:match("no-cache") or cache_control:match("must-revalidate") then
         return "STALE", meta
     end
@@ -74,14 +74,15 @@ function M.is_cacheable(method, status_code, headers)
     return true
 end
 
-function M.save_cache_meta(key, status_code, headers)
+function M.save_cache_meta(key, status_code, h11_headers, lua_h2_headers)
     local meta_path = get_meta_path(key)
     local meta = {
         timestamp = os.time(),
         status_code = status_code,
-        headers = headers,
-        etag = headers["etag"],
-        last_modified = headers["last-modified"]
+        headers = h11_headers,
+        lua_h2_headers = lua_h2_headers,
+        etag = h11_headers["etag"],
+        last_modified = h11_headers["last-modified"]
     }
     
     local meta_json, err_json = pcall(cjson.encode, meta)

@@ -175,11 +175,9 @@ end
 function M:write(data)
     local written = 0
     local total = #data
-    local c_data = ffi.new("uint8_t[?]", total)
-    ffi.copy(c_data, data)
     
     while written < total do
-        local ret = SSL.SSL_write(self.ssl, c_data + written, total - written)
+        local ret = SSL.SSL_write(self.ssl, data + written, total - written)
         
         if ret > 0 then
             written = written + ret

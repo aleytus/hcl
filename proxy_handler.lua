@@ -6,6 +6,8 @@ local SSL = bindings.ssl
 local SSL_UTILS = require("ssl_utils")
 local HTTP_PARSER = require("http_parser")
 local NGHTTP2_HANDLER = require("nghttp2_handler")
+local H11_TO_H2_TRANSLATOR = require("h11_to_h2_translator")
+local H2_TO_H11_TRANSLATOR = require("h2_to_h11_translator")
 local CACHE_LOGIC = require("cache_logic")
 local FFI_SSL_Socket = require("ffi_ssl_socket")
 
@@ -144,7 +146,7 @@ function ProxyHandler:handle_h11_connect(req)
     if not ok_conn then return nil, "remote connect failed: " .. err_conn end
     self.remote_sock = remote_sock
     
-    local client_ctx, err_client_ctx = SSL_UTILS.create_client_ctx(client_alpn == "h2")
+    local client_ctx, err_client_ctx = SSL_UTILS.create_client_ctx(true)
     if not client_ctx then return nil, "create_client_ctx failed: " .. (err_client_ctx or "") end
     
     local remote_ssl, err_remote_ssl = FFI_SSL_Socket:new(remote_sock, client_ctx, false)
@@ -161,10 +163,25 @@ function ProxyHandler:handle_h11_connect(req)
         if not h2_handler then return nil, "NGHTTP2_HANDLER:new failed: " .. (err_h2 or "") end
         
         local ok_h2_proxy, err_h2_proxy = h2_handler:run_proxy_loop()
-        if not ok_h2_proxy then print("H2 proxy loop failed: " .. err_h2_proxy) end
+        if not ok_h2_proxy then print("H2-H2 proxy loop failed: " .. err_h2_proxy) end
+        
+    elseif client_alpn == "h2" and remote_alpn ~= "h2" then
+        local translator, err_trans = H2_TO_H11_TRANSLATOR:new(client_ssl, remote_ssl, host)
+        if not translator then return nil, "H2_TO_H11_TRANSLATOR:new failed: " .. (err_trans or "") end
+        
+        local ok_trans, err_trans_run = translator:run_proxy_loop()
+        if not ok_trans then print("H2-H1.1 translator loop failed: " .. err_trans_run) end
+
+    elseif client_alpn ~= "h2" and remote_alpn == "h2" then
+        local translator, err_trans = H11_TO_H2_TRANSLATOR:new(client_ssl, remote_ssl, host)
+        if not translator then return nil, "H11_TO_H2_TRANSLATOR:new failed: " .. (err_trans or "") end
+        
+        local ok_trans, err_trans_run = translator:run_proxy_loop()
+        if not ok_trans then print("H1.1-H2 translator loop failed: " .. err_trans_run) end
+
     else
         local ok_pt, err_pt = self:run_tcp_passthrough(client_ssl, remote_ssl)
-        if not ok_pt then print("TCP passthrough failed: " .. err_pt) end
+        if not ok_pt then print("H1.1-H1.1 passthrough failed: " .. err_pt) end
     end
     
     return true
@@ -190,16 +207,21 @@ function ProxyHandler:run_h11_streaming_proxy(req, key, meta)
         string.format("%s %s %s\r\n", req.method, path, req.proto or "HTTP/1.1")
     }
     
+    local has_host = false
     for k, v in pairs(req.headers) do
         local key_lower = k:lower()
         if key_lower ~= "proxy-connection" and key_lower ~= "connection" and key_lower ~= "keep-alive" and key_lower ~= "transfer-encoding" then
             table.insert(h11_request_lines, string.format("%s: %s\r\n", k, v))
+            if key_lower == "host" then has_host = true end
         end
+    end
+    if not has_host then
+        table.insert(h11_request_lines, string.format("Host: %s\r\n", req.host))
     end
     
     if meta and meta.status == "STALE" then
-        if meta.etag then req.headers["if-none-match"] = meta.etag end
-        if meta.last_modified then req.headers["if-modified-since"] = meta.last_modified end
+        if meta.etag then h11_request_lines["if-none-match"] = meta.etag end
+        if meta.last_modified then h11_request_lines["if-modified-since"] = meta.last_modified end
     end
     
     table.insert(h11_request_lines, "Connection: close\r\n")
@@ -298,7 +320,12 @@ function ProxyHandler:handle_plain_http(req)
         return true
     end
     
-    return self:run_h11_streaming_proxy(req, key, {status=status, etag=meta and meta.etag, last_modified=meta and meta.last_modified})
+    local meta_for_req = nil
+    if status == "STALE" then
+        meta_for_req = meta
+    end
+    
+    return self:run_h11_streaming_proxy(req, key, meta_for_req)
 end
 
 function ProxyHandler:handle_request()

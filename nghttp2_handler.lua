@@ -38,12 +38,14 @@ typedef struct {
     char* url;
     int h2_status;
     bool cacheable;
-    void* cache_writer;
-    void* cache_reader;
+    void* cache_writer_handle;
+    void* cache_reader_handle;
 
     char* data_buffer;
     size_t data_len;
     size_t data_offset;
+    
+    void* stale_meta;
 } nghttp2_stream_data;
 ]]
 
@@ -101,7 +103,12 @@ local function get_stream_data(handler, stream_id)
     if not stream then
         local cdata = ffi_gc(ffi.new("nghttp2_stream_data"), function(s)
             if s.data_buffer ~= ffi.NULL then ffi.C.free(s.data_buffer) end
-            if s.cache_writer then ffi.cast("void(*)(void*)", s.cache_writer)(nil) end
+            if s.cache_writer_handle then
+                local writer = ffi.from_handle(s.cache_writer_handle)
+                writer(nil)
+            end
+            if s.cache_reader_handle then ffi.free_handle(s.cache_reader_handle) end
+            if s.stale_meta then ffi.free_handle(s.stale_meta) end
         end)
         
         cdata.stream_id = stream_id
@@ -115,8 +122,9 @@ local function get_stream_data(handler, stream_id)
         cdata.method = ffi.NULL
         cdata.url = ffi.NULL
         cdata.cacheable = false
-        cdata.cache_writer = ffi.NULL
-        cdata.cache_reader = ffi.NULL
+        cdata.cache_writer_handle = ffi.NULL
+        cdata.cache_reader_handle = ffi.NULL
+        cdata.stale_meta = ffi.NULL
         
         stream = {
             cdata = cdata,
@@ -186,15 +194,17 @@ function(session, stream_id, buf, length, data_flags, user_data)
         cdata.data_len = 0
         cdata.data_offset = 0
         
-        if cdata.cache_reader then
-            local chunk = ffi.cast("char*(*)(void*)", cdata.cache_reader)()
+        if cdata.cache_reader_handle ~= ffi.NULL then
+            local reader = ffi.from_handle(cdata.cache_reader_handle)
+            local chunk = reader()
             if chunk then
                 cdata.data_len = #chunk
                 cdata.data_buffer = ffi.C.malloc(cdata.data_len)
                 ffi.copy(cdata.data_buffer, chunk, cdata.data_len)
             else
                 data_flags[0] = bit_bor(data_flags[0], bindings.NGHTTP2_DATA_FLAG_EOF)
-                cdata.cache_reader = nil
+                ffi.free_handle(cdata.cache_reader_handle)
+                cdata.cache_reader_handle = ffi.NULL
                 return 0
             end
         else
@@ -209,7 +219,7 @@ function(session, stream_id, buf, length, data_flags, user_data)
     ffi.copy(buf, cdata.data_buffer + cdata.data_offset, copy_len)
     cdata.data_offset = cdata.data_offset + copy_len
     
-    if cdata.data_offset >= cdata.data_len and not cdata.cache_reader then
+    if cdata.data_offset >= cdata.data_len and cdata.cache_reader_handle == ffi.NULL then
         data_flags[0] = bit_bor(data_flags[0], bindings.NGHTTP2_DATA_FLAG_EOF)
         if cdata.data_buffer ~= ffi.NULL then
             ffi.C.free(cdata.data_buffer)
@@ -230,7 +240,7 @@ local function build_nva(headers_table)
         local v = headers_table[i+1]
         table.insert(nva_list, { name = k, value = v, namelen = #k, valuelen = #v, flags = 0 })
         if k:sub(1,1) ~= ":" then
-            h11_headers[k] = v
+            h11_headers[k:lower()] = v
         end
     end
     
@@ -267,11 +277,11 @@ local function c_on_frame_recv_callback(session, frame, user_data)
         local status, meta = CACHE_LOGIC.check_cache(cache_key)
         
         if status == "HIT" then
-            local nva_out, nvlen, h11_headers = build_nva(meta.lua_h2_headers)
+            local nva_out, nvlen = build_nva(meta.lua_h2_headers)
             local body_reader = CACHE_LOGIC.get_cache_body_reader(cache_key)
             
             if body_reader then
-                cdata.cache_reader = ffi.new_handle(body_reader)
+                cdata.cache_reader_handle = ffi.new_handle(body_reader)
                 data_prd = ffi.new("nghttp2_data_provider")
                 data_prd.read_callback = data_read_callback
                 data_prd.source.ptr = cdata
@@ -281,36 +291,39 @@ local function c_on_frame_recv_callback(session, frame, user_data)
             return 0
         end
 
-        local nva_out, nvlen, h11_headers = build_nva(stream.lua_request_headers)
+        local req_headers = stream.lua_request_headers
         if status == "STALE" then
-            table.insert(h11_headers, "if-none-match"); table.insert(h11_headers, meta.headers["etag"] or "")
-            table.insert(h11_headers, "if-modified-since"); table.insert(h11_headers, meta.headers["last-modified"] or "")
-            nva_out, nvlen = build_nva(h11_headers)
+            table.insert(req_headers, "if-none-match"); table.insert(req_headers, meta.headers["etag"] or "")
+            table.insert(req_headers, "if-modified-since"); table.insert(req_headers, meta.headers["last-modified"] or "")
+            cdata.stale_meta = ffi.new_handle(meta)
         end
         
+        local nva_out, nvlen = build_nva(req_headers)
         local new_stream_id = NGHTTP2.nghttp2_submit_headers(target_session, 0, -1, ffi.NULL, nva_out, nvlen, data_prd)
+        
         if new_stream_id > 0 then
             cdata.remote_stream_id = new_stream_id
             local remote_stream = get_stream_data(handler, new_stream_id)
             remote_stream.cdata.remote_stream_id = stream_id
             remote_stream.cdata.cache_key = cdata.cache_key
             remote_stream.cdata.method = cdata.method
-            if status == "STALE" then
-                remote_stream.stale_meta = meta
+            if cdata.stale_meta then
+                remote_stream.cdata.stale_meta = cdata.stale_meta
+                cdata.stale_meta = ffi.NULL
             end
         end
 
     else
-        local remote_stream = get_stream_data(handler, cdata.remote_stream_id)
-        if remote_stream.stale_meta and cdata.h2_status == 304 then
-            local meta = remote_stream.stale_meta
-            local nva_out, nvlen, h11_headers = build_nva(meta.lua_h2_headers)
+        local remote_stream_cdata = get_stream_data(handler, cdata.remote_stream_id).cdata
+        if remote_stream_cdata.stale_meta ~= ffi.NULL and cdata.h2_status == 304 then
+            local meta = ffi.from_handle(remote_stream_cdata.stale_meta)
+            local nva_out, nvlen = build_nva(meta.lua_h2_headers)
             local body_reader = CACHE_LOGIC.get_cache_body_reader(cdata.cache_key)
             if body_reader then
-                cdata.cache_reader = ffi.new_handle(body_reader)
+                remote_stream_cdata.cache_reader_handle = ffi.new_handle(body_reader)
                 data_prd = ffi.new("nghttp2_data_provider")
                 data_prd.read_callback = data_read_callback
-                data_prd.source.ptr = cdata
+                data_prd.source.ptr = remote_stream_cdata
             end
             NGHTTP2.nghttp2_submit_response(target_session, cdata.remote_stream_id, nva_out, nvlen, data_prd)
             CACHE_LOGIC.update_cache_meta(cdata.cache_key, meta)
@@ -319,10 +332,13 @@ local function c_on_frame_recv_callback(session, frame, user_data)
 
         local nva_out, nvlen, h11_headers = build_nva(stream.lua_headers)
         stream.lua_h11_headers = h11_headers
-        cdata.cacheable = CACHE_LOGIC.is_cacheable(remote_stream.cdata.method, cdata.h2_status, h11_headers)
+        cdata.cacheable = CACHE_LOGIC.is_cacheable(remote_stream_cdata.method, cdata.h2_status, h11_headers)
         
         if cdata.cacheable then
-            cdata.cache_writer = ffi.new_handle(CACHE_LOGIC.get_cache_body_writer(cdata.cache_key))
+            local writer = CACHE_LOGIC.get_cache_body_writer(cdata.cache_key)
+            if writer then
+                cdata.cache_writer_handle = ffi.new_handle(writer)
+            end
         end
 
         NGHTTP2.nghttp2_submit_response(target_session, cdata.remote_stream_id, nva_out, nvlen, data_prd)
@@ -337,8 +353,9 @@ local function c_on_data_chunk_recv_callback(session, flags, stream_id, data, le
     local stream = get_stream_data(handler, stream_id)
     local cdata = stream.cdata
 
-    if cdata.cache_writer and session == handler.remote_session then
-        ffi.cast("void(*)(void*, const char*, size_t)", cdata.cache_writer)(ffi.string(data, len))
+    if cdata.cache_writer_handle ~= ffi.NULL and session == handler.remote_session then
+        local writer = ffi.from_handle(cdata.cache_writer_handle)
+        writer(ffi.string(data, len))
     end
     
     local target_session = (session == handler.client_session) and handler.remote_session or handler.client_session
@@ -349,12 +366,20 @@ local function c_on_data_chunk_recv_callback(session, flags, stream_id, data, le
             cdata.data_len = len
             cdata.data_offset = 0
         else
-            local new_size = cdata.data_len + len
-            local new_buf = ffi.C.realloc(cdata.data_buffer, new_size)
+            local new_size = cdata.data_len - cdata.data_offset + len
+            local new_buf
+            if cdata.data_offset > 0 then
+                ffi.copy(cdata.data_buffer, cdata.data_buffer + cdata.data_offset, cdata.data_len - cdata.data_offset)
+                new_buf = ffi.C.realloc(cdata.data_buffer, new_size)
+            else
+                new_buf = ffi.C.realloc(cdata.data_buffer, new_size)
+            end
+            
             if new_buf ~= ffi.NULL then
                 cdata.data_buffer = new_buf
-                ffi.copy(new_buf + cdata.data_len, data, len)
+                ffi.copy(new_buf + cdata.data_len - cdata.data_offset, data, len)
                 cdata.data_len = new_size
+                cdata.data_offset = 0
             end
         end
         
@@ -371,15 +396,13 @@ local function c_on_stream_close_callback(session, stream_id, error_code, user_d
     if not stream then return 0 end
     local cdata = stream.cdata
     
-    if cdata.cache_writer and session == handler.remote_session then
-        ffi.cast("void(*)(void*)", cdata.cache_writer)(nil)
-        cdata.cache_writer = ffi.NULL
-        local remote_stream = get_stream_data(handler, cdata.remote_stream_id)
-        local meta_headers = {}
-        for i=1, #stream.lua_headers, 2 do
-            table.insert(meta_headers, {name=stream.lua_headers[i], value=stream.lua_headers[i+1]})
-        end
-        CACHE_LOGIC.save_cache_meta(cdata.cache_key, cdata.h2_status, stream.lua_h11_headers, meta_headers)
+    if cdata.cache_writer_handle ~= ffi.NULL and session == handler.remote_session then
+        local writer = ffi.from_handle(cdata.cache_writer_handle)
+        writer(nil)
+        ffi.free_handle(cdata.cache_writer_handle)
+        cdata.cache_writer_handle = ffi.NULL
+        
+        CACHE_LOGIC.save_cache_meta(cdata.cache_key, cdata.h2_status, stream.lua_h11_headers, stream.lua_headers)
     end
 
     local target_session = (session == handler.client_session) and handler.remote_session or handler.client_session
@@ -461,51 +484,10 @@ function M:send_settings(session)
     NGHTTP2.nghttp2_submit_settings(session, bindings.NGHTTP2_FLAG_NONE, iv, 2)
 end
 
-function M:io_loop(session)
-    local want_read = NGHTTP2.nghttp2_session_want_read(session)
-    local want_write = NGHTTP2.nghttp2_session_want_write(session)
-    
-    if want_read == 0 and want_write == 0 then
-        return true
-    end
-
-    local ssl_sock = (session == self.client_session) and self.client_ssl or self.remote_ssl
-    local raw_sock = ssl_sock:get_sock()
-    
-    local read_fds = {}
-    local write_fds = {}
-    
-    if want_read ~= 0 then table.insert(read_fds, raw_sock) end
-    if want_write ~= 0 then table.insert(write_fds, raw_sock) end
-    
-    local r, w, e = socket.select(
-        #read_fds > 0 and read_fds or nil,
-        #write_fds > 0 and write_fds or nil,
-        TIMEOUT
-    )
-    
-    if not r and not w then
-        return nil, e or "timeout"
-    end
-    
-    if r and #r > 0 then
-        local ret = NGHTTP2.nghttp2_session_recv(session)
-        if ret ~= 0 and ret ~= bindings.NGHTTP2_ERR_WOULDBLOCK then
-            return nil, NGHTTP2.nghttp2_strerror(ret)
-        end
-    end
-    
-    if w and #w > 0 then
-        local ret = NGHTTP2.nghttp2_session_send(session)
-        if ret ~= 0 and ret ~= bindings.NGHTTP2_ERR_WOULDBLOCK then
-            return nil, NGHTTP2.nghttp2_strerror(ret)
-        end
-    end
-    
-    return true
-end
-
 function M:run_proxy_loop()
+    local raw_sock1 = self.client_ssl:get_sock()
+    local raw_sock2 = self.remote_ssl:get_sock()
+    
     while true do
         local want_read1 = NGHTTP2.nghttp2_session_want_read(self.client_session)
         local want_write1 = NGHTTP2.nghttp2_session_want_write(self.client_session)
@@ -519,9 +501,6 @@ function M:run_proxy_loop()
         local read_fds = {}
         local write_fds = {}
         
-        local raw_sock1 = self.client_ssl:get_sock()
-        local raw_sock2 = self.remote_ssl:get_sock()
-
         if want_read1 ~= 0 then read_fds[raw_sock1] = true end
         if want_write1 ~= 0 then write_fds[raw_sock1] = true end
         if want_read2 ~= 0 then read_fds[raw_sock2] = true end

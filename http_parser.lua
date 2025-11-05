@@ -24,7 +24,7 @@ function M.parse_http11_request(raw_request)
         local k, v = line:match("^([^:]+):%s*(.*)$")
         if k then
             local key_lower = k:lower()
-            headers[key_lower] = v
+            headers[key_lower] = v:match("^[ \t]*(.-)[ \t]*$")
             if key_lower == "host" then
                 host = v:match("^[ \t]*(.-)[ \t]*$")
             end
@@ -93,50 +93,32 @@ function M.build_http11_response(status_code, status_text, headers, body)
     return response_line .. table.concat(header_lines) .. "\r\n" .. (body or "")
 end
 
-function M.headers_to_h2_nva(method, url, h11_headers)
-    local nva = {}
+function M.h2_headers_to_h11_request(h2_headers, host, proto)
+    local method, path
+    local h11_headers = {}
     
-    local host_header = h11_headers["host"] or ""
-    local scheme = "https"
-    
-    local path = url
-    local authority = host_header
-
-    if url:sub(1, 4) == "http" then
-        local s, a, p = url:match("^(https?)://([^/]+)(.*)$")
-        if s then
-            scheme, authority, path = s, a, p
-            path = path == "" and "/" or path
-        else
-            path = "/"
-        end
-    else
-        local s, a, p = url:match("^(https?)://([^/]+)(.*)$")
-         if s then
-            scheme, authority, path = s, a, p
-            path = path == "" and "/" or path
+    for i=1, #h2_headers, 2 do
+        local k = h2_headers[i]
+        local v = h2_headers[i+1]
+        if k == ":method" then
+            method = v
+        elseif k == ":path" then
+            path = v
+        elseif k:sub(1,1) ~= ":" then
+            h11_headers[k] = v
         end
     end
     
-    if method == "CONNECT" then
-        authority = url
-        path = nil
-        scheme = nil
-    end
-
-    table.insert(nva, { name = ":method", value = method })
-    if path then table.insert(nva, { name = ":path", value = path }) end
-    if scheme then table.insert(nva, { name = ":scheme", value = scheme }) end
-    if authority then table.insert(nva, { name = ":authority", value = authority }) end
+    h11_headers["Host"] = host
+    h11_headers["Connection"] = "keep-alive"
     
+    local request_line = string.format("%s %s %s\r\n", method, path, proto or "HTTP/1.1")
+    local header_lines = {}
     for k, v in pairs(h11_headers) do
-        local key_lower = k:lower()
-        if key_lower ~= "host" and key_lower ~= "connection" and key_lower ~= "proxy-connection" and key_lower ~= "keep-alive" and key_lower ~= "transfer-encoding" and key_lower ~= "upgrade" then
-            table.insert(nva, { name = key_lower, value = v })
-        end
+        table.insert(header_lines, k .. ": " .. v .. "\r\n")
     end
     
-    return nva
+    return request_line .. table.concat(header_lines) .. "\r\n"
 end
 
 function M.h2_headers_to_h11_response(nva)
